@@ -19,9 +19,13 @@ Set ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable.
 import os
 import json
 from typing import List, Optional, cast
+from dotenv import load_dotenv
 from deepagents import create_deep_agent
 from deepagents.types import SubAgent
 from langchain_core.tools import tool
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 # ============================================================================
