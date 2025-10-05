@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "planning-agent": "./main_simple.py:agent"
+  },
+  "env": ".env"
+}
