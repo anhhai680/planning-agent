@@ -45,26 +45,6 @@ COMMANDS = {
     "exit": "Exit the CLI",
 }
 
-# Common bash commands for autocomplete
-COMMON_BASH_COMMANDS = {
-    "ls": "List directory contents",
-    "ls -la": "List all files with details",
-    "cd": "Change directory",
-    "pwd": "Print working directory",
-    "cat": "Display file contents",
-    "grep": "Search text patterns",
-    "find": "Find files",
-    "mkdir": "Make directory",
-    "rm": "Remove file",
-    "cp": "Copy file",
-    "mv": "Move/rename file",
-    "echo": "Print text",
-    "touch": "Create empty file",
-    "head": "Show first lines",
-    "tail": "Show last lines",
-    "wc": "Count lines/words",
-    "chmod": "Change permissions",
-}
 
 # Maximum argument length for display
 MAX_ARG_LENGTH = 150
@@ -79,8 +59,10 @@ console = Console(highlight=False)
 class SessionState:
     """Holds mutable session state (auto-approve mode, etc)."""
 
-    def __init__(self, auto_approve: bool = False):
+    def __init__(self, auto_approve: bool = False) -> None:
         self.auto_approve = auto_approve
+        self.exit_hint_until: float | None = None
+        self.exit_hint_handle = None
 
     def toggle_auto_approve(self) -> bool:
         """Toggle auto-approve and return new state."""
@@ -117,7 +99,6 @@ def create_model():
         console.print(f"[dim]Using OpenAI model: {model_name}[/dim]")
         return ChatOpenAI(
             model=model_name,
-            temperature=0.7,
         )
     if anthropic_key:
         from langchain_anthropic import ChatAnthropic

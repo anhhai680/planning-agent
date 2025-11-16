@@ -7,11 +7,30 @@ database, etc.) and provide a uniform interface for file operations.
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Protocol, TypeAlias, TypedDict, runtime_checkable
 
 from langchain.tools import ToolRuntime
 
-from deepagents.backends.utils import FileInfo, GrepMatch
+
+class FileInfo(TypedDict, total=False):
+    """Structured file listing info.
+
+    Minimal contract used across backends. Only "path" is required.
+    Other fields are best-effort and may be absent depending on backend.
+    """
+
+    path: str
+    is_dir: bool
+    size: int  # bytes (approx)
+    modified_at: str  # ISO timestamp if known
+
+
+class GrepMatch(TypedDict):
+    """Structured grep match entry."""
+
+    path: str
+    line: int
+    text: str
 
 
 @dataclass
@@ -126,4 +145,52 @@ class BackendProtocol(Protocol):
         ...
 
 
+@dataclass
+class ExecuteResponse:
+    """Result of code execution.
+
+    Simplified schema optimized for LLM consumption.
+    """
+
+    output: str
+    """Combined stdout and stderr output of the executed command."""
+
+    exit_code: int | None = None
+    """The process exit code. 0 indicates success, non-zero indicates failure."""
+
+    truncated: bool = False
+    """Whether the output was truncated due to backend limitations."""
+
+
+@runtime_checkable
+class SandboxBackendProtocol(BackendProtocol, Protocol):
+    """Protocol for sandboxed backends with isolated runtime.
+
+    Sandboxed backends run in isolated environments (e.g., separate processes,
+    containers) and communicate via defined interfaces.
+    """
+
+    def execute(
+        self,
+        command: str,
+    ) -> ExecuteResponse:
+        """Execute a command in the process.
+
+        Simplified interface optimized for LLM consumption.
+
+        Args:
+            command: Full shell command string to execute.
+
+        Returns:
+            ExecuteResponse with combined output, exit code, optional signal, and truncation flag.
+        """
+        ...
+
+    @property
+    def id(self) -> str:
+        """Unique identifier for the sandbox backend."""
+        ...
+
+
 BackendFactory: TypeAlias = Callable[[ToolRuntime], BackendProtocol]
+BACKEND_TYPES = BackendProtocol | BackendFactory

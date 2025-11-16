@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from deepagents.backends.protocol import BACKEND_TYPES
 from deepagents.backends.utils import perform_string_replacement
 
 FileOpStatus = Literal["pending", "success", "error"]
@@ -44,8 +45,20 @@ def compute_unified_diff(
     display_path: str,
     *,
     max_lines: int | None = 800,
+    context_lines: int = 3,
 ) -> str | None:
-    """Compute a unified diff between before and after content."""
+    """Compute a unified diff between before and after content.
+
+    Args:
+        before: Original content
+        after: New content
+        display_path: Path for display in diff headers
+        max_lines: Maximum number of diff lines (None for unlimited)
+        context_lines: Number of context lines around changes (default 3)
+
+    Returns:
+        Unified diff string or None if no changes
+    """
     before_lines = before.splitlines()
     after_lines = after.splitlines()
     diff_lines = list(
@@ -55,13 +68,14 @@ def compute_unified_diff(
             fromfile=f"{display_path} (before)",
             tofile=f"{display_path} (after)",
             lineterm="",
+            n=context_lines,
         )
     )
     if not diff_lines:
         return None
     if max_lines is not None and len(diff_lines) > max_lines:
         truncated = diff_lines[: max_lines - 1]
-        truncated.append("... (diff truncated)")
+        truncated.append("...")
         return "\n".join(truncated)
     return "\n".join(diff_lines)
 
@@ -129,13 +143,10 @@ def format_display_path(path_str: str | None) -> str:
 
 def build_approval_preview(
     tool_name: str,
-    args: dict[str, Any] | None,
+    args: dict[str, Any],
     assistant_id: str | None,
 ) -> ApprovalPreview | None:
     """Collect summary info and diff for HITL approvals."""
-    if args is None:
-        return None
-
     path_str = str(args.get("file_path") or args.get("path") or "")
     display_path = format_display_path(path_str)
     physical_path = resolve_physical_path(path_str, assistant_id)
@@ -157,7 +168,6 @@ def build_approval_preview(
             f"File: {path_str}",
             "Action: Create new file" + (" (overwrites existing content)" if before else ""),
             f"Lines to write: {additions or total_lines}",
-            f"Bytes to write: {len(after.encode('utf-8'))}",
         ]
         return ApprovalPreview(
             title=f"Write {display_path}",
@@ -224,8 +234,10 @@ def build_approval_preview(
 class FileOpTracker:
     """Collect file operation metrics during a CLI interaction."""
 
-    def __init__(self, *, assistant_id: str | None) -> None:
+    def __init__(self, *, assistant_id: str | None, backend: BACKEND_TYPES | None = None) -> None:
+        """Initialize the tracker."""
         self.assistant_id = assistant_id
+        self.backend = backend
         self.active: dict[str | None, FileOperationRecord] = {}
         self.completed: list[FileOperationRecord] = []
 
@@ -292,6 +304,7 @@ class FileOpTracker:
             if isinstance(limit, int) and lines > limit:
                 record.metrics.end_line = (record.metrics.start_line or 1) + limit - 1
         else:
+            # For write/edit operations, read back from backend (or local filesystem)
             self._populate_after_content(record)
             if record.after_content is None:
                 record.status = "error"
@@ -337,10 +350,24 @@ class FileOpTracker:
         return record
 
     def _populate_after_content(self, record: FileOperationRecord) -> None:
-        if record.physical_path is None:
-            record.after_content = None
-            return
-        record.after_content = _safe_read(record.physical_path)
+        # Use backend if available (works for any BackendProtocol implementation)
+        if self.backend:
+            try:
+                file_path = record.args.get("file_path") or record.args.get("path")
+                if file_path:
+                    result = self.backend.read(file_path)
+                    # BackendProtocol.read() returns error string starting with "Error:" on failure
+                    record.after_content = None if result.startswith("Error:") else result
+                else:
+                    record.after_content = None
+            except Exception:
+                record.after_content = None
+        else:
+            # Fallback: direct filesystem read when no backend provided
+            if record.physical_path is None:
+                record.after_content = None
+                return
+            record.after_content = _safe_read(record.physical_path)
 
     def _finalize(self, record: FileOperationRecord) -> None:
         self.completed.append(record)
