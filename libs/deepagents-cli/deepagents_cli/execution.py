@@ -23,7 +23,8 @@ from rich.panel import Panel
 
 from deepagents_cli.config import COLORS, console
 from deepagents_cli.file_ops import FileOpTracker, build_approval_preview
-from deepagents_cli.input import parse_file_mentions
+from deepagents_cli.image_utils import create_multimodal_content
+from deepagents_cli.input import ImageTracker, parse_file_mentions
 from deepagents_cli.ui import (
     TokenTracker,
     format_tool_display,
@@ -39,8 +40,13 @@ _HITL_REQUEST_ADAPTER = TypeAdapter(HITLRequest)
 def prompt_for_tool_approval(
     action_request: ActionRequest,
     assistant_id: str | None,
-) -> Decision:
-    """Prompt user to approve/reject a tool action with arrow key navigation."""
+) -> Decision | dict:
+    """Prompt user to approve/reject a tool action with arrow key navigation.
+
+    Returns:
+        Decision (ApproveDecision or RejectDecision) OR
+        dict with {"type": "auto_approve_all"} to switch to auto-approve mode
+    """
     description = action_request.get("description", "No description available")
     name = action_request["name"]
     args = action_request["args"]
@@ -69,7 +75,7 @@ def prompt_for_tool_approval(
         console.print()
         render_diff_block(preview.diff, preview.diff_title or preview.title)
 
-    options = ["approve", "reject"]
+    options = ["approve", "reject", "auto-accept all going forward"]
     selected = 0  # Start with approve selected
 
     try:
@@ -87,8 +93,8 @@ def prompt_for_tool_approval(
 
             while True:
                 if not first_render:
-                    # Move cursor back to start of menu (up 2 lines, then to start of line)
-                    sys.stdout.write("\033[2A\r")
+                    # Move cursor back to start of menu (up 3 lines, then to start of line)
+                    sys.stdout.write("\033[3A\r")
 
                 first_render = False
 
@@ -100,15 +106,21 @@ def prompt_for_tool_approval(
                         if option == "approve":
                             # Green bold with filled checkbox
                             sys.stdout.write("\033[1;32m☑ Approve\033[0m\n")
-                        else:
+                        elif option == "reject":
                             # Red bold with filled checkbox
                             sys.stdout.write("\033[1;31m☑ Reject\033[0m\n")
+                        else:
+                            # Blue bold with filled checkbox for auto-accept
+                            sys.stdout.write("\033[1;34m☑ Auto-accept all going forward\033[0m\n")
                     elif option == "approve":
                         # Dim with empty checkbox
                         sys.stdout.write("\033[2m☐ Approve\033[0m\n")
-                    else:
+                    elif option == "reject":
                         # Dim with empty checkbox
                         sys.stdout.write("\033[2m☐ Reject\033[0m\n")
+                    else:
+                        # Dim with empty checkbox
+                        sys.stdout.write("\033[2m☐ Auto-accept all going forward\033[0m\n")
 
                 sys.stdout.flush()
 
@@ -148,13 +160,22 @@ def prompt_for_tool_approval(
         # Fallback for non-Unix systems
         console.print("  ☐ (A)pprove  (default)")
         console.print("  ☐ (R)eject")
-        choice = input("\nChoice (A/R, default=Approve): ").strip().lower()
-        selected = 1 if choice in {"r", "reject"} else 0
+        console.print("  ☐ (Auto)-accept all going forward")
+        choice = input("\nChoice (A/R/Auto, default=Approve): ").strip().lower()
+        if choice in {"r", "reject"}:
+            selected = 1
+        elif choice in {"auto", "auto-accept"}:
+            selected = 2
+        else:
+            selected = 0
 
     # Return decision based on selection
     if selected == 0:
         return ApproveDecision(type="approve")
-    return RejectDecision(type="reject", message="User rejected the command")
+    if selected == 1:
+        return RejectDecision(type="reject", message="User rejected the command")
+    # Return special marker for auto-approve mode
+    return {"type": "auto_approve_all"}
 
 
 async def execute_task(
@@ -164,7 +185,8 @@ async def execute_task(
     session_state,
     token_tracker: TokenTracker | None = None,
     backend=None,
-):
+    image_tracker: ImageTracker | None = None,
+) -> None:
     """Execute any task by passing it directly to the AI agent."""
     # Parse file mentions and inject content if any
     prompt_text, mentioned_files = parse_file_mentions(user_input)
@@ -187,8 +209,17 @@ async def execute_task(
     else:
         final_input = prompt_text
 
+    # Include images in the message content
+    images_to_send = []
+    if image_tracker:
+        images_to_send = image_tracker.get_images()
+    if images_to_send:
+        message_content = create_multimodal_content(final_input, images_to_send)
+    else:
+        message_content = final_input
+
     config = {
-        "configurable": {"thread_id": "main"},
+        "configurable": {"thread_id": session_state.thread_id},
         "metadata": {"assistant_id": assistant_id} if assistant_id else {},
     }
 
@@ -240,8 +271,13 @@ async def execute_task(
         console.print(markdown, style=COLORS["agent"])
         pending_text = ""
 
+    # Clear images from tracker after creating the message
+    # (they've been encoded into the message content)
+    if image_tracker:
+        image_tracker.clear()
+
     # Stream input - may need to loop if there are interrupts
-    stream_input = {"messages": [{"role": "user", "content": final_input}]}
+    stream_input = {"messages": [{"role": "user", "content": message_content}]}
 
     try:
         while True:
@@ -262,7 +298,7 @@ async def execute_task(
                 if not isinstance(chunk, tuple) or len(chunk) != 3:
                     continue
 
-                namespace, current_stream_mode, data = chunk
+                _namespace, current_stream_mode, data = chunk
 
                 # Handle UPDATES stream - for interrupts and todos
                 if current_stream_mode == "updates":
@@ -311,7 +347,7 @@ async def execute_task(
                     if not isinstance(data, tuple) or len(data) != 2:
                         continue
 
-                    message, metadata = data
+                    message, _metadata = data
 
                     if isinstance(message, HumanMessage):
                         content = message.text
@@ -412,7 +448,9 @@ async def execute_task(
                                 # For now, skip it or handle minimally
 
                         # Handle tool call chunks
-                        elif block_type == "tool_call_chunk":
+                        # Some models (OpenAI, Anthropic) stream tool_call_chunks
+                        # Others (Gemini) don't stream them and just return the full tool_call
+                        elif block_type in ("tool_call_chunk", "tool_call"):
                             chunk_name = block.get("name")
                             chunk_args = block.get("args")
                             chunk_id = block.get("id")
@@ -453,8 +491,6 @@ async def execute_task(
                             buffer_id = buffer.get("id")
                             if buffer_name is None:
                                 continue
-                            if buffer_id is not None and buffer_id in displayed_tool_ids:
-                                continue
 
                             parsed_args = buffer.get("args")
                             if isinstance(parsed_args, str):
@@ -474,8 +510,13 @@ async def execute_task(
 
                             flush_text_buffer(final=True)
                             if buffer_id is not None:
-                                displayed_tool_ids.add(buffer_id)
-                                file_op_tracker.start_operation(buffer_name, parsed_args, buffer_id)
+                                if buffer_id not in displayed_tool_ids:
+                                    displayed_tool_ids.add(buffer_id)
+                                    file_op_tracker.start_operation(
+                                        buffer_name, parsed_args, buffer_id
+                                    )
+                                else:
+                                    file_op_tracker.update_args(buffer_id, parsed_args)
                             tool_call_buffers.pop(buffer_key, None)
                             icon = tool_icons.get(buffer_name, "🔧")
 
@@ -545,7 +586,37 @@ async def execute_task(
                                 action_request,
                                 assistant_id,
                             )
+
+                            # Check if user wants to switch to auto-approve mode
+                            if (
+                                isinstance(decision, dict)
+                                and decision.get("type") == "auto_approve_all"
+                            ):
+                                # Switch to auto-approve mode
+                                session_state.auto_approve = True
+                                console.print()
+                                console.print("[bold blue]✓ Auto-approve mode enabled[/bold blue]")
+                                console.print(
+                                    "[dim]All future tool actions will be automatically approved.[/dim]"
+                                )
+                                console.print()
+
+                                # Approve this action and all remaining actions in the batch
+                                decisions.append({"type": "approve"})
+                                for _remaining_action in hitl_request["action_requests"][
+                                    action_index + 1 :
+                                ]:
+                                    decisions.append({"type": "approve"})
+                                break
                             decisions.append(decision)
+
+                            # Mark file operations as HIL-approved if user approved
+                            if decision.get("type") == "approve":
+                                tool_name = action_request.get("name")
+                                if tool_name in {"write_file", "edit_file"}:
+                                    file_op_tracker.mark_hitl_approved(
+                                        tool_name, action_request.get("args", {})
+                                    )
 
                         if any(decision.get("type") == "reject" for decision in decisions):
                             any_rejected = True
